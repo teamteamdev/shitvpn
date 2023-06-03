@@ -43,55 +43,6 @@ def parse_tcp(data):
     body = data[offset>>2:]
     return src_port, dst_port, flag, body
 
-def parse_l2tp(data):
-    if data[0] & 0x80:
-        length, tunnel_id, session_id, ns, nr = struct.unpack('>HHHHH', data[2:12])
-        body = {}
-        pos = 12
-        while pos < len(data):
-            avplen, vendor_id, attrtp = struct.unpack('>HHH', data[pos:pos+6])
-            avplen &= 0x3ff
-            value = data[pos+6:pos+avplen]
-            if attrtp == 0:
-                value = enums.L2TPType(struct.unpack('>H', value)[0])
-            elif attrtp in (2, 9, 10, 14):
-                value, = struct.unpack('>H', value)
-            elif attrtp in (3, 15, 19, 24):
-                value, = struct.unpack('>I', value)
-            body[enums.L2TPAttr(attrtp)] = value
-            pos += avplen
-        return tunnel_id, session_id, ns, nr, body
-    else:
-        pos = 2
-        if data[0] & 0x40:
-            pos += 2
-        tunnel_id, session_id = struct.unpack('>HH', data[pos:pos+4])
-        pos += 4
-        if data[0] & 0x08:
-            ns, nr = struct.unpack('>HH', data[pos:pos+4])
-            pos += 4
-        else:
-            ns = nr = 0
-        if data[0] & 0x04:
-            off, = struct.unpack('>H', data[pos:pos+2])
-            pos += 2+off
-        return tunnel_id, session_id, ns, nr, data[pos:]
-
-def make_l2tp(tunnel_id, session_id, ns, nr, body):
-    if type(body) is dict:
-        data = bytearray()
-        for k, v in sorted(body.items()):
-            if k in (0, 2, 9, 10, 14):
-                v = struct.pack('>H', v)
-            elif k in (3, 15, 19, 24):
-                v = struct.pack('>I', v)
-            data.extend(struct.pack('>HHH', (len(v)+6)|0x8000, 0, k) + v)
-        header = struct.pack('>HHHHHH', 0xc802, len(data)+12, tunnel_id, session_id, ns, nr)
-    else:
-        data = body
-        header = struct.pack('>HHHH', 0x4002, len(data)+8, tunnel_id, session_id)
-    return header + data
-
 class State(enum.Enum):
     LISTEN = 0
     SYN_SENT = 1
@@ -382,6 +333,7 @@ class IPPacket:
         self.urserver = args.urserver
         self.DIRECT = args.DIRECT
         self.verbose = args.v if args.v else 0
+
     def schedule(self, host_name, port, udp=False):
         rserver = self.urserver if udp else self.rserver
         filter_cond = lambda o: o.alive and o.match_rule(host_name, port)
@@ -399,6 +351,7 @@ class IPPacket:
             return min(filter(filter_cond, rserver), default=None, key=lambda i: i.total)
         else:
             raise Exception('Unknown scheduling algorithm') #Unreachable
+
     def handle_ipv4(self, remote_id, data, reply):
         proto, src_ip, dst_ip, ip_body = parse_ipv4(data)
         dst_name = self.dns_cache.ip2domain(str(dst_ip)) if self.dns_cache else str(dst_ip)
@@ -474,88 +427,3 @@ class IPPacket:
                     print(f'ICMP {remote_id[0]} -> {dst_name} Data={ip_body}')
         else:
             print(f'{enums.IpProto(proto).name} -> {dst_name} Data={data}')
-    def handle_l2tp(self, remote_id, data, reply):
-        src_port, dst_port, udp_body = parse_udp(data)
-        tunnel_id, session_id, ns, nr, l2tp_body = parse_l2tp(udp_body)
-        # print(tunnel_id, session_id, ns, nr, l2tp_body)
-        def reply_l2tp(l2tp_body):
-            # print('reply', l2tp_body)
-            ns_nr = type(l2tp_body) is dict
-            udp_body = make_l2tp(tunnel_id, session_id, nr if ns_nr else None, ns+1 if ns_nr else None, l2tp_body)
-            ip_body = make_udp(dst_port, src_port, udp_body)
-            return reply(ip_body)
-        if type(l2tp_body) is dict:
-            msgtp = l2tp_body[enums.L2TPAttr.MsgType]
-            if msgtp == enums.L2TPType.SCCRQ:
-                tunnel_id = l2tp_body[enums.L2TPAttr.TunnelID]
-                l2tp_body[enums.L2TPAttr.MsgType] = enums.L2TPType.SCCRP
-                l2tp_body[enums.L2TPAttr.HostName] = b'python-esp\x00'
-                reply_l2tp(l2tp_body)
-            elif msgtp in (enums.L2TPType.SCCCN, enums.L2TPType.ICCN):
-                reply_l2tp({})
-            elif msgtp == enums.L2TPType.ICRQ:
-                session_id = l2tp_body[enums.L2TPAttr.SessionID]
-                l2tp_body[enums.L2TPAttr.MsgType] = enums.L2TPType.ICRP
-                l2tp_body.pop(enums.L2TPAttr.CallSerial)
-                reply_l2tp(l2tp_body)
-        else:
-            HEAD = struct.Struct('>BBH')
-            def parse_lcp(body, reply_body):
-                code, mid, mlen = HEAD.unpack(body[:4])
-                magic = b'PESP'
-                if code == 1:
-                    l2tp_body = HEAD.pack(2, mid, len(body)) + body[4:]
-                    reply_body(l2tp_body)
-                    s = b'\x02\x06\x00\x00\x00\x00\x05\x06'+magic+b'\x07\x02\x08\x02'
-                    reply_body(HEAD.pack(1, mid+1, len(s)+4) + s)
-                elif code == 2:
-                    reply_body(HEAD.pack(9, mid, 8) + magic)
-                elif code == 9:
-                    reply_body(HEAD.pack(10, mid, 8) + magic)
-            def parse_ccp(body, reply_body):
-                code, mid, mlen = HEAD.unpack(body[:4])
-                if code == 1:
-                    reply_body(HEAD.pack(2, mid, len(body)) + body[4:])
-                    reply_body(HEAD.pack(1, mid+1, 4))
-            def parse_ipcp(body, reply_body):
-                code, mid, mlen = HEAD.unpack(body[:4])
-                if code == 1:
-                    if b'\x03\x06\x00\x00\x00\x00' not in body:
-                        reply_body(HEAD.pack(2, mid, len(body)) + body[4:])
-                    else:
-                        addr = ipaddress.ip_address('10.0.0.1').packed
-                        dns = ipaddress.ip_address(self.dns_server).packed
-                        s = b'\x03\x06'+addr+b'\x81\x06'+dns+b'\x83\x06\x00\x00\x00\x00'
-                        reply_body(HEAD.pack(3, mid, len(s)+4) + s)
-                        addr = ipaddress.ip_address('10.0.0.2').packed
-                        reply_body(HEAD.pack(1, mid+1, 10) + b'\x03\x06' + addr)
-            def parse_ipv6cp(body, reply_body):
-                code, mid, mlen = HEAD.unpack(body[:4])
-                if code == 1:
-                    reply_body(HEAD.pack(2, mid, len(body)) + body[4:])
-                    reply_body(HEAD.pack(1, mid, 14) + b'\x01\x0a' + os.urandom(8))
-            def parse_ip(body, reply_body):
-                self.handle_ipv4(remote_id, body, reply_body)
-            CONTROLS = (( b'\xff\x03\xc0\x21', parse_lcp ),
-                        ( b'\xff\x03\x80\xfd', parse_ccp ),
-                        ( b'\x80\x21', parse_ipcp ),
-                        ( b'\xff\x03\x80\x21', parse_ipcp ),
-                        ( b'\x80\x57', parse_ipv6cp ),
-                        ( b'\x21', parse_ip),
-                        ( b'\xff\x03\x00\x21', parse_ip),
-                       )
-            for head, control in CONTROLS:
-                if l2tp_body.startswith(head):
-                    body = l2tp_body[len(head):]
-                    control(body, lambda data: reply_l2tp(head+data))
-    def handle(self, remote_id, header, data, reply):
-        if header == enums.IpProto.IPV4:
-            self.handle_ipv4(remote_id, data, reply)
-        elif header == enums.IpProto.UDP:
-            src_port, dst_port, udp_body = parse_udp(data)
-            if dst_port == 1701:
-                self.handle_l2tp(remote_id, data, reply)
-            else:
-                print(f'UDP Unhandled Port={dst_port}. Data={udp_body}')
-        else:
-            print(f'{enums.IpProto(header).name} Unhandled Protocol. Data={data}')

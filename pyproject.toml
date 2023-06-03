@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "pvpn"
+version = "0.2.5"
+description = "Python VPN server."
+authors = ["Qian Wenjie <qianwenjie@gmail.com>"]
+homepage = "https://github.com/qwj/python-vpn"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pycryptodome = "^3.18.0"
+pproxy = "^2.7.8"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
